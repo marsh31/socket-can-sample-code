@@ -1,57 +1,57 @@
 /*
- *
- *
- *
+ * CAN マルチ ID 送信マネージャ ライブラリ (CAN FD対応)
+ * - timerfd ベースの1スレッドで複数 ID/周期を送信
+ * - data[0..(len-2)] はアプリ側、data[(len-1)] はアライブカウンタ
  */
 
 #ifndef CAN_MANAGER_H
 #define CAN_MANAGER_H
 
+#include <stdint.h>
+#include <linux/can.h>
 
-/*
- *
- */
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* Opaque types */
 typedef struct tx_context_t tx_context_t;
+typedef struct tx_object_t  tx_object_t;
 
+/* コンテキスト生成/破棄 */
+tx_context_t *open_canfd(const char *ifname, int base_period_ms);
+void          close_canfd(tx_context_t *ctx);
 
-/*
- *
- */
-typedef struct tx_object_t tx_object_t;
+/* 送信スレッド制御 */
+int  start_canfd(tx_context_t *ctx);  /* 0:OK, -1:NG */
+void stop_canfd(tx_context_t *ctx);   /* join まで実施 */
 
+/* 送信オブジェクト登録（簡易: DLC>=8, payloadは先頭7B）*/
+int  add_canfd_frame(tx_context_t *ctx,
+                     canid_t can_id,
+                     uint8_t dlc,
+                     int period_ms,
+                     const uint8_t init_payload[7]); /* 戻り値: index/-1 */
 
-/*
- *
- */
-extern tx_context_t *open_canfd(const char *ifname);
+/* 送信オブジェクト登録（拡張: 可変長/FD BRS）*/
+int  add_canfd_frame_ex(tx_context_t *ctx,
+                        canid_t can_id,
+                        uint8_t len,            /* 1..64 (末尾1Bはalive) */
+                        int period_ms,
+                        const uint8_t *payload, /* payload_len = len-1 */
+                        int use_brs);           /* 1:CANFD_BRS */
 
+/* ペイロード更新 */
+void tx_update_payload   (tx_context_t *ctx, int index, const uint8_t payload[7]);
+void tx_update_payload_ex(tx_context_t *ctx, int index, const uint8_t *payload, uint8_t len);
 
-/*
- *
- */
-extern void close_canfd(tx_context_t *ctx);
+/* 有効/無効やBRS切替 */
+void tx_set_enabled(tx_context_t *ctx, int index, int enabled);
+void tx_set_brs    (tx_context_t *ctx, int index, int enable);
 
-
-/*
- *
- */
-extern int start_canfd(tx_context_t *ctx);
-
-
-/*
- *
- */
-extern void stop_canfd(tx_context_t *ctx);
-
-
-/*
- *
- */
-extern int add_canfd_frame(tx_context_t *ctx,
-                           canid_t can_id,
-                           uint8_t dlc,
-                           int period_ms,
-                           const uint8_t init_payload);
-
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* CAN_MANAGER_H */
+
