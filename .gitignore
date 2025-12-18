@@ -1,0 +1,58 @@
+###############################################
+# cansocket プロジェクト用 .gitignore
+###############################################
+
+# ビルド生成物（make で再生成可能）
+/builds/
+/lib/
+
+# 中間ファイル
+*.o
+*.d
+
+# ライブラリ/共有オブジェクト
+*.a
+*.so
+*.so.*
+
+# 実行ファイル（念のため個別指定も）
+/builds/cansocket
+a.out
+
+# ツール/解析の出力
+*.log
+gmon.out
+perf.data*
+vgcore.*
+*.gcda
+*.gcno
+*.gcov
+
+# デバッガ/キャッシュ
+.gdb_history
+.ccache/
+
+# 一時・バックアップ
+*~
+#*#
+*.swp
+*.swo
+*.swx
+*.tmp
+*.bak
+*.orig
+*.rej
+nohup.out
+
+# エディタ/IDE 設定（必要なら除外）
+.vscode/
+.idea/
+*.iml
+
+# OS 生成物
+.DS_Store
+Thumbs.db
+
+# コンパイルデータベース（生成する場合）
+compile_commands.json
+
