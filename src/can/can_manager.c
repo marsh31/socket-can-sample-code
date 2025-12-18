@@ -9,6 +9,8 @@
 #include <net/if.h>
 #include <pthread.h>
 #include <sched.h>
+#include <poll.h>
+#include <fcntl.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -47,6 +49,13 @@ struct tx_context_t {
 
   int running;           /* スレッド稼働中フラグ */
   pthread_t tx_thread;   /* 送信スレッド */
+  pthread_t rx_thread;   /* 受信スレッド */
+  int tx_started;        /* 送信スレッド起動済み */
+  int rx_started;        /* 受信スレッド起動済み */
+
+  /* 受信通知 */
+  can_rx_callback_t rx_cb;
+  void *rx_user;
 
   int num_objs;                      /* 使用中オブジェクト数 */
   struct tx_object_t objs[MAX_TX_OBJECTS];
@@ -56,6 +65,7 @@ static int  setup_can_socket(const char *ifname);
 static int  setup_timerfd(int base_period_ms);
 static void set_realtime_priority_for_thread(void);
 static void *tx_thread_main(void *arg);
+static void *rx_thread_main(void *arg);
 
 tx_context_t *open_canfd(const char *ifname, int base_period_ms)
 {
@@ -100,9 +110,15 @@ int start_canfd(tx_context_t *ctx)
   if (!ctx) return -1;
   if (ctx->running) return 0;
   ctx->running = 1;
-  if (pthread_create(&ctx->tx_thread, NULL, tx_thread_main, ctx) != 0) {
+  if (pthread_create(&ctx->tx_thread, NULL, tx_thread_main, ctx) == 0) {
+    ctx->tx_started = 1;
+  } else {
     ctx->running = 0;
     return -1;
+  }
+  /* 受信スレッド開始（失敗しても送信のみで継続） */
+  if (pthread_create(&ctx->rx_thread, NULL, rx_thread_main, ctx) == 0) {
+    ctx->rx_started = 1;
   }
   return 0;
 }
@@ -119,7 +135,15 @@ void stop_canfd(tx_context_t *ctx)
     its.it_interval.tv_nsec = 1;
     timerfd_settime(ctx->tfd, 0, &its, NULL);
   }
-  pthread_join(ctx->tx_thread, NULL);
+  if (ctx->tx_started) {
+    pthread_join(ctx->tx_thread, NULL);
+    ctx->tx_started = 0;
+  }
+  if (ctx->rx_started) {
+    /* rx スレッドは poll のタイムアウトで順次終了する */
+    pthread_join(ctx->rx_thread, NULL);
+    ctx->rx_started = 0;
+  }
 }
 
 int add_canfd_frame(tx_context_t *ctx,
@@ -282,6 +306,49 @@ static void *tx_thread_main(void *arg)
   return NULL;
 }
 
+static void *rx_thread_main(void *arg)
+{
+  tx_context_t *ctx = (tx_context_t *)arg;
+  while (ctx->running) {
+    struct pollfd pfd;
+    pfd.fd = ctx->sock;
+    pfd.events = POLLIN;
+    int pr = poll(&pfd, 1, 200); /* 200ms 周期で終了条件を確認 */
+    if (pr < 0) {
+      if (errno == EINTR) continue;
+      break;
+    }
+    if (pr == 0) continue; /* timeout */
+    if (!(pfd.revents & POLLIN)) continue;
+
+    unsigned char buf[sizeof(struct canfd_frame)] = {0};
+    ssize_t n = read(ctx->sock, buf, sizeof(buf));
+    if (n < 0) {
+      if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) continue;
+      break; /* その他のエラーは終了 */
+    }
+
+    struct canfd_frame cfd;
+    if ((size_t)n == sizeof(struct canfd_frame)) {
+      memcpy(&cfd, buf, sizeof(struct canfd_frame));
+    } else if ((size_t)n == sizeof(struct can_frame)) {
+      struct can_frame *cf = (struct can_frame *)buf;
+      memset(&cfd, 0, sizeof(cfd));
+      cfd.can_id = cf->can_id;
+      cfd.len    = cf->can_dlc;
+      cfd.flags  = 0;
+      memcpy(cfd.data, cf->data, (size_t)cfd.len);
+    } else {
+      /* サイズ不整合 */
+      continue;
+    }
+
+    can_rx_callback_t cb = ctx->rx_cb;
+    if (cb) cb(&cfd, ctx->rx_user);
+  }
+  return NULL;
+}
+
 static int setup_can_socket(const char *ifname)
 {
   int s;
@@ -296,6 +363,10 @@ static int setup_can_socket(const char *ifname)
     close(s);
     return -1;
   }
+
+  /* poll() を使うため非ブロッキング化（write の EAGAIN は上位で許容）*/
+  int fl = fcntl(s, F_GETFL, 0);
+  if (fl >= 0) (void)fcntl(s, F_SETFL, fl | O_NONBLOCK);
 
   memset(&ifr, 0, sizeof(ifr));
   strncpy(ifr.ifr_name, ifname, IFNAMSIZ - 1);
@@ -329,4 +400,11 @@ static int setup_timerfd(int base_period_ms)
     return -1;
   }
   return tfd;
+}
+
+void set_canfd_rx_callback(tx_context_t *ctx, can_rx_callback_t cb, void *user)
+{
+  if (!ctx) return;
+  ctx->rx_cb   = cb;
+  ctx->rx_user = user;
 }
