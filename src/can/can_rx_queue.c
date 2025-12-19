@@ -1,4 +1,10 @@
+#include <linux/can.h>
+#include <linux/can/raw.h>
+#include <pthread.h>
 #include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
 
 #include "can_manager.h"
 
@@ -47,16 +53,12 @@ void can_rx_queue_destroy(can_rx_queue_t *obj)
 
 int can_rx_queue_push(can_rx_queue_t *q, const struct canfd_frame *frame)
 {
-  char *copy = strdup(str);
-  if (!copy) return 1;
-
   pthread_mutex_lock(&q->mutex);
-  while (q->count == q->capacity) {
+  while (q->count == MAX_RX_QUEUES) {
     pthread_cond_wait(&q->not_full, &q->mutex);
   }
 
-
-  q->frames[q->tail] = copy;
+  q->frames[q->tail] = *frame;
   q->tail            = (q->tail + 1) % MAX_RX_QUEUES;
   q->count++;
 
@@ -103,8 +105,8 @@ int can_rx_queue_try_push(can_rx_queue_t *q, const struct canfd_frame *frame)
     return 1;
   }
 
-  q->buf[q->tail] = copy;
-  q->tail         = (q->tail + 1) % MAX_RX_QUEUES;
+  q->frames[q->tail] = copy;
+  q->tail            = (q->tail + 1) % MAX_RX_QUEUES;
   q->count++;
 
   pthread_cond_signal(&q->not_empty);
@@ -122,8 +124,8 @@ int can_rx_queue_try_pop(can_rx_queue_t *q, struct canfd_frame *frame)
     return 1;
   }
 
-  frame   = q->buf[q->head];
-  q->head = (q->head + 1) % q->capacity;
+  *frame  = q->frames[q->head];
+  q->head = (q->head + 1) % MAX_RX_QUEUES;
   q->count--;
 
   pthread_cond_signal(&q->not_full);

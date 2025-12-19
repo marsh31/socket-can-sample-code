@@ -1,13 +1,12 @@
 // 受信制御モジュール
 #define _GNU_SOURCE
 #include <errno.h>
-#include <string.h>
-#include <unistd.h>
-#include <poll.h>
-#include <pthread.h>
-
 #include <linux/can.h>
 #include <linux/can/raw.h>
+#include <poll.h>
+#include <pthread.h>
+#include <string.h>
+#include <unistd.h>
 
 #include "can_internal.h"
 
@@ -16,9 +15,9 @@ static void *rx_thread_main(void *arg)
   can_context_t *ctx = (can_context_t *)arg;
   while (ctx->running) {
     struct pollfd pfd;
-    pfd.fd = ctx->sock;
+    pfd.fd     = ctx->sock;
     pfd.events = POLLIN;
-    int pr = poll(&pfd, 1, 200); /* 200ms 周期で終了条件を確認 */
+    int pr     = poll(&pfd, 1, 200); /* 200ms 周期で終了条件を確認 */
     if (pr < 0) {
       if (errno == EINTR) continue;
       break;
