@@ -50,15 +50,15 @@ int main(int argc, char *argv[])
   /* 受信通知を登録（不要なら NULL を指定）*/
   set_canfd_rx_callback(ctx, on_rx, NULL);
 
-  /* 例1: DLC=8 (従来互換)、10ms 周期 */
+  /* 例1: DLC=8 (従来CAN)、10ms 周期 */
   uint8_t p100[8] = {0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88};
-  int idx100 = add_canfd_frame(ctx, 0x100, 8, 10, p100, 1, 0, 0, NULL, NULL);
+  int idx100 = add_canfd_frame(ctx, 0x100, 8, 10, p100, 1, 0, 1, NULL, NULL);
 
   /* 例2: CAN FD DLC=32、50ms 周期、BRS 有効 */
   uint8_t p200[32];
   for (int i = 0; i < 32; ++i) p200[i] = (uint8_t)(i);
   int idx200 = add_canfd_frame(
-      ctx, can_extended_format(0x11000000), 32, 50, p200, 1, 0, 0, NULL, NULL);
+      ctx, can_extended_format(0x11000000), 32, 50, p200, 1, 0, 1, NULL, NULL);
 
   if (idx100 < 0 || idx200 < 0) {
     fprintf(stderr, "add_canfd_frame failed\n");
@@ -82,13 +82,14 @@ int main(int argc, char *argv[])
 
     if (elapsed_ms % 100 == 0) {
       p100[0]++;
-      tx_update_payload(ctx, idx100, p100, 8);
+      /* ID指定の更新（互換API）*/
+      tx_update_payload(ctx, 0x100, p100, 8);
     }
 
     if (elapsed_ms % 250 == 0) {
-      /* 31バイトの先頭だけ更新 */
+      /* 先頭だけ更新（例） */
       p200[0]++;
-      tx_update_payload(ctx, idx200, p200, 32);
+      tx_update_payload(ctx, can_extended_format(0x11000000), p200, 32);
     }
 
     if (elapsed_ms >= 10 * 1000) { /* 10秒で自動終了(必要なら無限運転) */

@@ -39,31 +39,41 @@ static void *tx_thread_main(void *arg)
         if (obj->tick_div <= 0) continue;
         if ((tick % obj->tick_div) != 0) continue;
 
-        struct canfd_frame frame;
-        memset(&frame, 0, sizeof(frame));
-        frame.can_id = obj->can_id;
-        frame.len    = obj->dlc; /* 1..64 */
-        frame.flags  = obj->fd_flags;
-
+        /* payloadのスナップショットを先に取得 */
         uint8_t snap[64];
         pthread_mutex_lock(&obj->mtx);
         memcpy(snap, obj->payload, sizeof(obj->payload));
         pthread_mutex_unlock(&obj->mtx);
 
+        /* CAN/CAN FD いずれにも対応するため共用体で生成 */
+        union {
+          struct can_frame cf;
+          struct canfd_frame cfd;
+        } u;
+        memset(&u, 0, sizeof(u));
 
-        if (obj->send_cb) {
-          obj->send_cb(obj->can_id, obj->dlc, frame.data, snap);
+        const int is_fd = (obj->fd_flags & CANFD_FDF) == CANFD_FDF;
+        if (is_fd) {
+          u.cfd.can_id = obj->can_id;
+          u.cfd.len    = obj->dlc;
+          u.cfd.flags  = obj->fd_flags;
+          if (obj->send_cb) {
+            obj->send_cb(obj->can_id, obj->dlc, u.cfd.data, snap);
+          } else {
+            memcpy(u.cfd.data, snap, obj->dlc);
+          }
+          (void)write(ctx->sock, &u.cfd, sizeof(struct canfd_frame));
         } else {
-          memcpy(frame.data, snap, obj->dlc);
+          u.cf.can_id  = obj->can_id;
+          u.cf.can_dlc = (obj->dlc > 8) ? 8 : obj->dlc;
+          if (obj->send_cb) {
+            obj->send_cb(obj->can_id, u.cf.can_dlc, u.cf.data, snap);
+          } else {
+            memcpy(u.cf.data, snap, u.cf.can_dlc);
+          }
+          (void)write(ctx->sock, &u.cf, sizeof(struct can_frame));
         }
-
-        ssize_t sent;
-        if ((obj->fd_flags & CANFD_FDF) == CANFD_FDF) {
-          sent = write(ctx->sock, &frame, sizeof(struct can_frame));
-        } else {
-          sent = write(ctx->sock, &frame, sizeof(struct canfd_frame));
-        }
-        (void)sent; /* 送信失敗はログ等にしたければここで対応 */
+        /* 送信失敗は必要に応じてログ化を検討 */
       }
     }
   }

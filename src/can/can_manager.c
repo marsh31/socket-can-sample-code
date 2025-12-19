@@ -112,20 +112,21 @@ canid_t can_extended_format(canid_t can_id)
 
 int add_canfd_frame(can_context_t *ctx,
                     canid_t can_id,
-                    uint8_t len, /* 1..64 (末尾1Bはalive) */
+                    uint8_t len, /* 1..64 */
                     int period_ms,
-                    const uint8_t *payload, /* payload_len = len-1 */
+                    const uint8_t *payload, /* payload_len = len */
                     int use_brs,            /* 1:CANFD_BRS */
                     int use_esi,
-                    int use_fdf,
+                    int use_fdf,            /* 1:FDフレーム */
                     can_tx_update_cb_t update_cb,
                     can_tx_send_cb_t send_cb)
 {
   if (!ctx) return -1;
   if (ctx->num_objs >= MAX_TX_OBJECTS) return -1;
   if (period_ms <= 0 || period_ms % ctx->base_period_ms != 0) return -1;
-  if (len < 0) return -1;
   if (len > 64) len = 64;
+  /* CAN FDフレームでない場合は8バイトまで */
+  if (!use_fdf && len > 8) return -1;
 
   tx_object_t *obj = &ctx->objs[ctx->num_objs];
   memset(obj, 0, sizeof(*obj));
@@ -141,6 +142,9 @@ int add_canfd_frame(can_context_t *ctx,
   int fdf_flags = use_fdf ? CANFD_FDF : 0;
   obj->fd_flags = brs_flags | esi_flags | fdf_flags;
 
+  obj->update_cb = update_cb;
+  obj->send_cb   = send_cb;
+
   pthread_mutex_init(&obj->mtx, NULL);
   memset(obj->payload, 0, sizeof(obj->payload));
   if (payload) {
@@ -152,10 +156,10 @@ int add_canfd_frame(can_context_t *ctx,
 }
 
 
-void tx_update_payload(can_context_t *ctx,
-                       canid_t can_id,
-                       const uint8_t *payload,
-                       uint8_t len)
+void tx_update_payload_by_id(can_context_t *ctx,
+                             canid_t can_id,
+                             const uint8_t *payload,
+                             uint8_t len)
 {
   if (!ctx || !payload) return;
 
@@ -169,10 +173,41 @@ void tx_update_payload(can_context_t *ctx,
   if (obj->update_cb) {
     obj->update_cb(obj->can_id, obj->dlc, obj->payload, payload);
   } else {
-    memcpy(obj->payload, payload, obj->dlc);
+    /* 入力長に応じて安全にコピー */
+    uint8_t n = (len < obj->dlc) ? len : obj->dlc;
+    memcpy(obj->payload, payload, n);
   }
 
   pthread_mutex_unlock(&obj->mtx);
+}
+
+void tx_update_payload_by_index(can_context_t *ctx,
+                                int index,
+                                const uint8_t *payload,
+                                uint8_t len)
+{
+  if (!ctx || !payload) return;
+  if (index < 0 || index >= ctx->num_objs) return;
+
+  tx_object_t *obj = &ctx->objs[index];
+
+  pthread_mutex_lock(&obj->mtx);
+  if (obj->update_cb) {
+    obj->update_cb(obj->can_id, obj->dlc, obj->payload, payload);
+  } else {
+    uint8_t n = (len < obj->dlc) ? len : obj->dlc;
+    memcpy(obj->payload, payload, n);
+  }
+  pthread_mutex_unlock(&obj->mtx);
+}
+
+/* 互換API: ID指定の更新（非推奨）*/
+void tx_update_payload(can_context_t *ctx,
+                       canid_t can_id,
+                       const uint8_t *payload,
+                       uint8_t len)
+{
+  tx_update_payload_by_id(ctx, can_id, payload, len);
 }
 
 void tx_set_enabled(can_context_t *ctx, int index, int enabled)
