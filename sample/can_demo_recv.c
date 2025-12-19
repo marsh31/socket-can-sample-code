@@ -62,7 +62,20 @@ int main()
     }
 
     if (nbytes < (ssize_t)sizeof(struct canfd_frame)) {
-      fprintf(stderr, "incomplete CAN FD frame %zd bytes\n", nbytes);
+      if (nbytes < (ssize_t)sizeof(struct can_frame)) {
+        fprintf(
+            stderr, "incomplete CAN frame / CAN FD frame %zd bytes\n", nbytes);
+        continue;
+      }
+
+      printf("Received CAN frame: can id=0x%X, len=%d, data=",
+             frame.can_id,
+             frame.len);
+
+      for (int i = 0; i < frame.len; i++) {
+        printf("%02X ", frame.data[i]);
+      }
+      printf("\n");
       continue;
     }
 

@@ -52,7 +52,7 @@ int main(int argc, char *argv[])
 
   /* 例1: DLC=8 (従来CAN)、10ms 周期 */
   uint8_t p100[8] = {0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88};
-  int idx100 = add_canfd_frame(ctx, 0x100, 8, 10, p100, 1, 0, 1, NULL, NULL);
+  int idx100 = add_canfd_frame(ctx, 0x100, 8, 10, p100, 0, 0, 0, NULL, NULL);
 
   /* 例2: CAN FD DLC=32、50ms 周期、BRS 有効 */
   uint8_t p200[32];
@@ -83,12 +83,14 @@ int main(int argc, char *argv[])
     if (elapsed_ms % 100 == 0) {
       p100[0]++;
       /* ID指定の更新（互換API）*/
+      printf("update 0x100: %x\n", p100[0]);
       tx_update_payload(ctx, 0x100, p100, 8);
     }
 
     if (elapsed_ms % 250 == 0) {
       /* 先頭だけ更新（例） */
       p200[0]++;
+      printf("update 0x11000000: %x\n", p200[0]);
       tx_update_payload(ctx, can_extended_format(0x11000000), p200, 32);
     }
 

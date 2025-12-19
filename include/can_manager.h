@@ -16,6 +16,8 @@ extern "C" {
 typedef struct can_context_t can_context_t;
 typedef struct tx_object_t tx_object_t;
 
+typedef struct can_rx_queue_t can_rx_queue_t;
+
 typedef void (*can_tx_update_cb_t)(canid_t can_id,
                                    uint8_t dlc,
                                    uint8_t *payload,
@@ -58,7 +60,7 @@ int add_canfd_frame(can_context_t *ctx,
                     const uint8_t *payload, /* payload_len = len */
                     int use_brs,            /* 1:CANFD_BRS */
                     int use_esi,
-                    int use_fdf,            /* 1:FDフレーム */
+                    int use_fdf, /* 1:FDフレーム */
                     can_tx_update_cb_t update_cb,
                     can_tx_send_cb_t send_cb);
 
@@ -84,6 +86,16 @@ void tx_update_payload(can_context_t *ctx,
 /* 有効/無効やBRS切替 */
 void tx_set_enabled(can_context_t *ctx, int index, int enabled);
 void tx_set_brs(can_context_t *ctx, int index, int enable);
+
+
+can_rx_queue_t *can_rx_queue_init(void);
+void can_rx_queue_destroy(can_rx_queue_t *obj);
+
+int can_rx_queue_push(can_rx_queue_t *q, const struct canfd_frame *frame);
+int can_rx_queue_pop(can_rx_queue_t *q, struct canfd_frame *frame);
+
+int can_rx_queue_try_push(can_rx_queue_t *q, const struct canfd_frame *frame);
+int can_rx_queue_try_pop(can_rx_queue_t *q, struct canfd_frame *frame);
 
 #ifdef __cplusplus
 }
