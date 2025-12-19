@@ -1,16 +1,14 @@
-// ライブラリ: 複数ID/複数周期を1スレッドで送信管理
+// ライブラリ: 送受信マネージャ（スレッド制御／ソケット初期化）
 
 #define _GNU_SOURCE
 #include "can_manager.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <linux/can.h>
 #include <linux/can/raw.h>
 #include <net/if.h>
 #include <pthread.h>
-#include <sched.h>
-#include <poll.h>
-#include <fcntl.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -22,54 +20,16 @@
 #include <time.h>
 #include <unistd.h>
 
-#define MAX_TX_OBJECTS 8
+#include "can_internal.h"
 
-/* ビットレート切替(BRS)を使う場合は1にする */
-#ifndef CANMGR_ENABLE_BRS
-#define CANMGR_ENABLE_BRS 0
-#endif
+/* 前方宣言 */
+static int setup_can_socket(const char *ifname);
+static int setup_timerfd(int base_period_ms);
+static int search_cantx_index(can_context_t *ctx, canid_t can_id);
 
-struct tx_object_t {
-  int enabled;           /* 1:送信有効 */
-  canid_t can_id;        /* CAN ID */
-  uint8_t dlc;           /* DLC (8以上推奨) */
-  int period_ms;         /* 送信周期[ms] */
-  int tick_div;          /* period_ms / base_period_ms */
-
-  uint8_t payload[64];   /* アプリ提供データ(最大64B)。APIでは先頭7Bを使用 */
-  uint8_t alive_counter; /* 下位4bitで使用する例 */
-  uint8_t fd_flags;      /* CAN FD flags (e.g. CANFD_BRS) */
-  pthread_mutex_t mtx;   /* payload 保護 */
-};
-
-struct tx_context_t {
-  int sock;              /* CAN ソケット */
-  int tfd;               /* timerfd */
-  int base_period_ms;    /* ベース周期[ms] */
-
-  int running;           /* スレッド稼働中フラグ */
-  pthread_t tx_thread;   /* 送信スレッド */
-  pthread_t rx_thread;   /* 受信スレッド */
-  int tx_started;        /* 送信スレッド起動済み */
-  int rx_started;        /* 受信スレッド起動済み */
-
-  /* 受信通知 */
-  can_rx_callback_t rx_cb;
-  void *rx_user;
-
-  int num_objs;                      /* 使用中オブジェクト数 */
-  struct tx_object_t objs[MAX_TX_OBJECTS];
-};
-
-static int  setup_can_socket(const char *ifname);
-static int  setup_timerfd(int base_period_ms);
-static void set_realtime_priority_for_thread(void);
-static void *tx_thread_main(void *arg);
-static void *rx_thread_main(void *arg);
-
-tx_context_t *open_canfd(const char *ifname, int base_period_ms)
+can_context_t *open_canfd(const char *ifname, int base_period_ms)
 {
-  tx_context_t *ctx = (tx_context_t *)calloc(1, sizeof(tx_context_t));
+  can_context_t *ctx = (can_context_t *)calloc(1, sizeof(can_context_t));
   if (!ctx) return NULL;
 
   ctx->sock = setup_can_socket(ifname);
@@ -86,12 +46,16 @@ tx_context_t *open_canfd(const char *ifname, int base_period_ms)
     return NULL;
   }
 
-  ctx->running  = 0;
-  ctx->num_objs = 0;
+  ctx->running    = 0;
+  ctx->tx_started = 0;
+  ctx->rx_started = 0;
+  ctx->rx_cb      = NULL;
+  ctx->rx_user    = NULL;
+  ctx->num_objs   = 0;
   return ctx;
 }
 
-void close_canfd(tx_context_t *ctx)
+void close_canfd(can_context_t *ctx)
 {
   if (!ctx) return;
   if (ctx->running) {
@@ -105,28 +69,28 @@ void close_canfd(tx_context_t *ctx)
   free(ctx);
 }
 
-int start_canfd(tx_context_t *ctx)
+int start_canfd(can_context_t *ctx)
 {
   if (!ctx) return -1;
   if (ctx->running) return 0;
+
   ctx->running = 1;
-  if (pthread_create(&ctx->tx_thread, NULL, tx_thread_main, ctx) == 0) {
-    ctx->tx_started = 1;
-  } else {
+  if (can_tx_start(ctx) != 0) {
     ctx->running = 0;
     return -1;
   }
-  /* 受信スレッド開始（失敗しても送信のみで継続） */
-  if (pthread_create(&ctx->rx_thread, NULL, rx_thread_main, ctx) == 0) {
-    ctx->rx_started = 1;
-  }
+
+  /* 受信スレッドは失敗しても送信のみで継続 */
+  (void)can_rx_start(ctx);
+
   return 0;
 }
 
-void stop_canfd(tx_context_t *ctx)
+void stop_canfd(can_context_t *ctx)
 {
   if (!ctx || !ctx->running) return;
   ctx->running = 0;
+
   /* できるだけ早く read() を抜けさせるため、最短周期に更新 */
   if (ctx->tfd >= 0) {
     struct itimerspec its;
@@ -135,109 +99,90 @@ void stop_canfd(tx_context_t *ctx)
     its.it_interval.tv_nsec = 1;
     timerfd_settime(ctx->tfd, 0, &its, NULL);
   }
-  if (ctx->tx_started) {
-    pthread_join(ctx->tx_thread, NULL);
-    ctx->tx_started = 0;
-  }
-  if (ctx->rx_started) {
-    /* rx スレッドは poll のタイムアウトで順次終了する */
-    pthread_join(ctx->rx_thread, NULL);
-    ctx->rx_started = 0;
-  }
+
+  can_tx_stop(ctx);
+  can_rx_stop(ctx);
 }
 
-int add_canfd_frame(tx_context_t *ctx,
+canid_t can_extended_format(canid_t can_id)
+{
+  return (can_id | CAN_EFF_FLAG);
+}
+
+
+int add_canfd_frame(can_context_t *ctx,
                     canid_t can_id,
-                    uint8_t dlc,
+                    uint8_t len, /* 1..64 (末尾1Bはalive) */
                     int period_ms,
-                    const uint8_t init_payload[7])
+                    const uint8_t *payload, /* payload_len = len-1 */
+                    int use_brs,            /* 1:CANFD_BRS */
+                    int use_esi,
+                    int use_fdf,
+                    can_tx_update_cb_t update_cb,
+                    can_tx_send_cb_t send_cb)
 {
   if (!ctx) return -1;
   if (ctx->num_objs >= MAX_TX_OBJECTS) return -1;
   if (period_ms <= 0 || period_ms % ctx->base_period_ms != 0) return -1;
-
-  tx_object_t *obj = &ctx->objs[ctx->num_objs];
-  memset(obj, 0, sizeof(*obj));
-  obj->enabled     = 1;
-  obj->can_id      = can_id;
-  /* CAN FD: len(=dlc)は1..64（末尾1Bはアライブ）*/
-  obj->dlc         = (dlc < 1) ? 1 : (dlc > 64 ? 64 : dlc);
-  obj->period_ms   = period_ms;
-  obj->tick_div    = period_ms / ctx->base_period_ms;
-  obj->fd_flags    = 0;
-  pthread_mutex_init(&obj->mtx, NULL);
-  memset(obj->payload, 0, sizeof(obj->payload));
-  memcpy(obj->payload, init_payload, 7);
-  obj->alive_counter = 0;
-
-  ctx->num_objs++;
-  return ctx->num_objs - 1; /* index */
-}
-
-int add_canfd_frame_ex(tx_context_t *ctx,
-                       canid_t can_id,
-                       uint8_t len,
-                       int period_ms,
-                       const uint8_t *payload,
-                       int use_brs)
-{
-  if (!ctx) return -1;
-  if (ctx->num_objs >= MAX_TX_OBJECTS) return -1;
-  if (period_ms <= 0 || period_ms % ctx->base_period_ms != 0) return -1;
-  if (len < 1) return -1;              /* alive を置くため最低1 */
+  if (len < 0) return -1;
   if (len > 64) len = 64;
 
   tx_object_t *obj = &ctx->objs[ctx->num_objs];
   memset(obj, 0, sizeof(*obj));
-  obj->enabled     = 1;
-  obj->can_id      = can_id;
-  obj->dlc         = len;
-  obj->period_ms   = period_ms;
-  obj->tick_div    = period_ms / ctx->base_period_ms;
-  obj->fd_flags    = use_brs ? CANFD_BRS : 0;
+
+  obj->enabled   = 1;
+  obj->can_id    = can_id;
+  obj->dlc       = len;
+  obj->period_ms = period_ms;
+  obj->tick_div  = period_ms / ctx->base_period_ms;
+
+  int brs_flags = use_brs ? CANFD_BRS : 0;
+  int esi_flags = use_esi ? CANFD_ESI : 0;
+  int fdf_flags = use_fdf ? CANFD_FDF : 0;
+  obj->fd_flags = brs_flags | esi_flags | fdf_flags;
+
   pthread_mutex_init(&obj->mtx, NULL);
   memset(obj->payload, 0, sizeof(obj->payload));
   if (payload) {
-    size_t copy = (len - 1) > 63 ? 63 : (size_t)(len - 1);
-    memcpy(obj->payload, payload, copy);
+    memcpy(obj->payload, payload, len);
   }
-  obj->alive_counter = 0;
 
   ctx->num_objs++;
   return ctx->num_objs - 1;
 }
 
-void tx_update_payload(tx_context_t *ctx, int index, const uint8_t payload[7])
-{
-  if (!ctx) return;
-  if (index < 0 || index >= ctx->num_objs) return;
-  tx_object_t *obj = &ctx->objs[index];
-  pthread_mutex_lock(&obj->mtx);
-  memcpy(obj->payload, payload, 7);
-  pthread_mutex_unlock(&obj->mtx);
-}
 
-void tx_update_payload_ex(tx_context_t *ctx, int index, const uint8_t *payload, uint8_t len)
+void tx_update_payload(can_context_t *ctx,
+                       canid_t can_id,
+                       const uint8_t *payload,
+                       uint8_t len)
 {
   if (!ctx || !payload) return;
+
+  int index = search_cantx_index(ctx, can_id);
   if (index < 0 || index >= ctx->num_objs) return;
+
   tx_object_t *obj = &ctx->objs[index];
-  uint8_t max_copy = (obj->dlc > 0) ? (obj->dlc - 1) : 0;
-  if (len > max_copy) len = max_copy;
+
   pthread_mutex_lock(&obj->mtx);
-  /* 先頭から len バイトだけ更新（残りは保持）*/
-  if (len > 0) memcpy(obj->payload, payload, len);
+
+  if (obj->update_cb) {
+    obj->update_cb(obj->can_id, obj->dlc, obj->payload, payload);
+  } else {
+    memcpy(obj->payload, payload, obj->dlc);
+  }
+
   pthread_mutex_unlock(&obj->mtx);
 }
 
-void tx_set_enabled(tx_context_t *ctx, int index, int enabled)
+void tx_set_enabled(can_context_t *ctx, int index, int enabled)
 {
   if (!ctx) return;
   if (index < 0 || index >= ctx->num_objs) return;
   ctx->objs[index].enabled = enabled ? 1 : 0;
 }
 
-void tx_set_brs(tx_context_t *ctx, int index, int enable)
+void tx_set_brs(can_context_t *ctx, int index, int enable)
 {
   if (!ctx) return;
   if (index < 0 || index >= ctx->num_objs) return;
@@ -245,108 +190,6 @@ void tx_set_brs(tx_context_t *ctx, int index, int enable)
     ctx->objs[index].fd_flags |= CANFD_BRS;
   else
     ctx->objs[index].fd_flags &= (uint8_t)~CANFD_BRS;
-}
-
-static void set_realtime_priority_for_thread(void)
-{
-  struct sched_param sp;
-  memset(&sp, 0, sizeof(sp));
-  sp.sched_priority = 20; /* 環境に応じて調整 */
-  pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp); /* 失敗しても致命的ではない */
-}
-
-static void *tx_thread_main(void *arg)
-{
-  tx_context_t *ctx = (tx_context_t *)arg;
-  uint64_t tick = 0;
-  set_realtime_priority_for_thread();
-
-  while (ctx->running) {
-    uint64_t expirations = 0;
-    ssize_t n = read(ctx->tfd, &expirations, sizeof(expirations));
-    if (n < 0) {
-      if (errno == EINTR) continue;
-      break;
-    }
-    for (uint64_t e = 0; e < expirations; ++e) {
-      tick++;
-      for (int i = 0; i < ctx->num_objs; ++i) {
-        tx_object_t *obj = &ctx->objs[i];
-        if (!obj->enabled) continue;
-        if (obj->tick_div <= 0) continue;
-        if ((tick % obj->tick_div) != 0) continue;
-
-        struct canfd_frame frame;
-        memset(&frame, 0, sizeof(frame));
-        frame.can_id = obj->can_id;
-        frame.len    = obj->dlc; /* 1..64 */
-        frame.flags  = obj->fd_flags;
-
-        /* アプリデータは dlc-1 バイトまで、末尾1B をアライブに使用 */
-        uint8_t snap[64];
-        pthread_mutex_lock(&obj->mtx);
-        memcpy(snap, obj->payload, sizeof(obj->payload));
-        pthread_mutex_unlock(&obj->mtx);
-
-        int len = frame.len <= 0 ? 1 : frame.len;
-        int alive_idx = len - 1;
-        int app_len   = alive_idx;
-        if (app_len > 0) memcpy(frame.data, snap, (size_t)app_len);
-        frame.data[alive_idx] = obj->alive_counter & 0x0F; /* 下位4bit */
-        obj->alive_counter = (obj->alive_counter + 1) & 0x0F;
-
-        ssize_t sent = write(ctx->sock, &frame, sizeof(frame));
-        if (sent != sizeof(frame)) {
-          /* 送信失敗はログのみ */
-          if (sent < 0) perror("write(CAN)");
-        }
-      }
-    }
-  }
-  return NULL;
-}
-
-static void *rx_thread_main(void *arg)
-{
-  tx_context_t *ctx = (tx_context_t *)arg;
-  while (ctx->running) {
-    struct pollfd pfd;
-    pfd.fd = ctx->sock;
-    pfd.events = POLLIN;
-    int pr = poll(&pfd, 1, 200); /* 200ms 周期で終了条件を確認 */
-    if (pr < 0) {
-      if (errno == EINTR) continue;
-      break;
-    }
-    if (pr == 0) continue; /* timeout */
-    if (!(pfd.revents & POLLIN)) continue;
-
-    unsigned char buf[sizeof(struct canfd_frame)] = {0};
-    ssize_t n = read(ctx->sock, buf, sizeof(buf));
-    if (n < 0) {
-      if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) continue;
-      break; /* その他のエラーは終了 */
-    }
-
-    struct canfd_frame cfd;
-    if ((size_t)n == sizeof(struct canfd_frame)) {
-      memcpy(&cfd, buf, sizeof(struct canfd_frame));
-    } else if ((size_t)n == sizeof(struct can_frame)) {
-      struct can_frame *cf = (struct can_frame *)buf;
-      memset(&cfd, 0, sizeof(cfd));
-      cfd.can_id = cf->can_id;
-      cfd.len    = cf->can_dlc;
-      cfd.flags  = 0;
-      memcpy(cfd.data, cf->data, (size_t)cfd.len);
-    } else {
-      /* サイズ不整合 */
-      continue;
-    }
-
-    can_rx_callback_t cb = ctx->rx_cb;
-    if (cb) cb(&cfd, ctx->rx_user);
-  }
-  return NULL;
 }
 
 static int setup_can_socket(const char *ifname)
@@ -359,7 +202,12 @@ static int setup_can_socket(const char *ifname)
   s = socket(PF_CAN, SOCK_RAW, CAN_RAW);
   if (s < 0) return -1;
 
-  if (setsockopt(s, SOL_CAN_RAW, CAN_RAW_FD_FRAMES, &enable_canfd, sizeof(enable_canfd)) < 0) {
+  if (setsockopt(s,
+                 SOL_CAN_RAW,
+                 CAN_RAW_FD_FRAMES,
+                 &enable_canfd,
+                 sizeof(enable_canfd))
+      < 0) {
     close(s);
     return -1;
   }
@@ -402,7 +250,19 @@ static int setup_timerfd(int base_period_ms)
   return tfd;
 }
 
-void set_canfd_rx_callback(tx_context_t *ctx, can_rx_callback_t cb, void *user)
+static int search_cantx_index(can_context_t *ctx, canid_t can_id)
+{
+  if (!ctx) return -1;
+  for (int i = 0; i < ctx->num_objs; i++) {
+    if (ctx->objs[i].can_id == can_id) {
+      return i;
+    }
+  }
+
+  return -1;
+}
+
+void set_canfd_rx_callback(can_context_t *ctx, can_rx_callback_t cb, void *user)
 {
   if (!ctx) return;
   ctx->rx_cb   = cb;
